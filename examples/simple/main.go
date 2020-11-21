@@ -17,8 +17,8 @@ func (u *User) MethodThatTakesContext(ctx map[string]interface{}) string {
 
 // Resource
 type UserResource struct {
-	DisplayName            string `deepcopier:"field:Name"`
 	SkipMe                 string `deepcopier:"skip"`
+	DisplayName            string `deepcopier:"field:Name"`
 	MethodThatTakesContext string `deepcopier:"context"`
 }
 

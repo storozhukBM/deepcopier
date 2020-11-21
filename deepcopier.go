@@ -3,8 +3,10 @@ package deepcopier
 import (
 	"database/sql/driver"
 	"fmt"
+	"math"
 	"reflect"
 	"strings"
+	"unsafe"
 )
 
 const (
@@ -54,14 +56,363 @@ func (dc *DeepCopier) WithContext(ctx map[string]interface{}) *DeepCopier {
 // To sets the destination.
 func (dc *DeepCopier) To(dst interface{}) error {
 	dc.dst = dst
-	return process(dc.dst, dc.src, Options{Context: dc.ctx})
+	specs, err := preProcess(dc.dst, dc.src, Options{Context: dc.ctx})
+	if err != nil {
+		return err
+	}
+	fmt.Printf("specs: %+v\n", specs)
+	executeSpec(specs, dc.dst, dc.src)
+	return nil
+	//return process(dc.dst, dc.src, Options{Context: dc.ctx})
 }
 
 // From sets the given the source as destination and destination as source.
 func (dc *DeepCopier) From(src interface{}) error {
 	dc.dst = dc.src
 	dc.src = src
-	return process(dc.dst, dc.src, Options{Context: dc.ctx, Reversed: true})
+	specs, err := preProcess(dc.dst, dc.src, Options{Context: dc.ctx, Reversed: true})
+	if err != nil {
+		return err
+	}
+	fmt.Printf("specs: %+v\n", specs)
+	executeSpec(specs, dc.dst, dc.src)
+	return nil
+}
+
+type copyType byte
+
+const (
+	unknown            copyType = 0
+	directCopy         copyType = 1
+	indirectCopy       copyType = 2
+	ptrToInterfaceCopy copyType = 3
+)
+
+type fieldCopySpec struct {
+	size       uintptr
+	srcOffset  uintptr
+	srcTypePtr uintptr
+	dstOffset  uintptr
+	copyType   copyType
+}
+
+type interfaceTuple struct {
+	typePtr uintptr
+	dataPtr uintptr
+}
+
+func executeSpec(specs []fieldCopySpec, dst interface{}, src interface{}) {
+	srcInterfaceTuple := *(*interfaceTuple)(unsafe.Pointer(&src))
+	directSrcMemoryHdr := reflect.SliceHeader{
+		Data: srcInterfaceTuple.dataPtr,
+		Len:  math.MaxInt64,
+		Cap:  math.MaxInt64,
+	}
+	directSrcMemory := *(*[]byte)(unsafe.Pointer(&directSrcMemoryHdr))
+
+	dstInterfaceTuple := *(*interfaceTuple)(unsafe.Pointer(&dst))
+	directDstMemoryHdr := reflect.SliceHeader{
+		Data: dstInterfaceTuple.dataPtr,
+		Len:  math.MaxInt64,
+		Cap:  math.MaxInt64,
+	}
+	directDstMemory := *(*[]byte)(unsafe.Pointer(&directDstMemoryHdr))
+
+	for _, copySpec := range specs {
+		switch copySpec.copyType {
+		case directCopy:
+			srcMem := directSrcMemory[copySpec.srcOffset : copySpec.srcOffset+copySpec.size]
+			dstMem := directDstMemory[copySpec.dstOffset : copySpec.dstOffset+copySpec.size]
+			copy(dstMem, srcMem)
+			continue
+		case indirectCopy:
+			srcPointerMem := directSrcMemory[copySpec.srcOffset : copySpec.srcOffset+8]
+			srcPointer := (*(*[]uintptr)(unsafe.Pointer(&srcPointerMem)))[0]
+			if srcPointer == 0 {
+				continue
+			}
+			indirectSrcMemoryHdr := reflect.SliceHeader{
+				Data: srcPointer,
+				Len:  math.MaxInt64,
+				Cap:  math.MaxInt64,
+			}
+			indirectSrcMemory := *(*[]byte)(unsafe.Pointer(&indirectSrcMemoryHdr))
+			srcMem := indirectSrcMemory[0:copySpec.size]
+			dstMem := directDstMemory[copySpec.dstOffset : copySpec.dstOffset+copySpec.size]
+			copy(dstMem, srcMem)
+			continue
+		case ptrToInterfaceCopy:
+			dstInterfaceMem := directDstMemory[copySpec.dstOffset:]
+			dstInterfaceMemSlice := *(*[]uintptr)(unsafe.Pointer(&dstInterfaceMem))
+
+			srcPtrMem := directSrcMemory[copySpec.srcOffset:]
+			srcPtrMemSlice := *(*[]uintptr)(unsafe.Pointer(&srcPtrMem))
+
+			dstInterfaceMemSlice[0] = copySpec.srcTypePtr
+			dstInterfaceMemSlice[1] = srcPtrMemSlice[0]
+			continue
+		default:
+			panic(fmt.Sprintf("unsupported copy spec type: %+v", copySpec))
+		}
+	}
+}
+
+func preProcess(dst interface{}, src interface{}, args ...Options) ([]fieldCopySpec, error) {
+	var (
+		options        = Options{}
+		srcValue       = reflect.Indirect(reflect.ValueOf(src))
+		dstValue       = reflect.Indirect(reflect.ValueOf(dst))
+		srcFieldNames  = getFieldNames(src)
+		srcMethodNames = getMethodNames(src)
+	)
+
+	if len(args) > 0 {
+		options = args[0]
+	}
+
+	if !dstValue.CanAddr() {
+		return nil, fmt.Errorf("destination %+v is unaddressable", dstValue.Interface())
+	}
+
+	fieldSpecs := make([]fieldCopySpec, 0, 16)
+
+	for _, f := range srcFieldNames {
+		var (
+			srcFieldValue               = srcValue.FieldByName(f)
+			srcFieldType, srcFieldFound = srcValue.Type().FieldByName(f)
+			srcFieldName                = srcFieldType.Name
+			dstFieldName                = srcFieldName
+			tagOptions                  TagOptions
+		)
+
+		if !srcFieldFound {
+			continue
+		}
+
+		if options.Reversed {
+			tagOptions = getTagOptions(srcFieldType.Tag.Get(TagName))
+			if v, ok := tagOptions[FieldOptionName]; ok && v != "" {
+				dstFieldName = v
+			}
+		} else {
+			if name, opts := getRelatedField(dst, srcFieldName); name != "" {
+				dstFieldName, tagOptions = name, opts
+			}
+		}
+
+		if _, ok := tagOptions[SkipOptionName]; ok {
+			continue
+		}
+
+		var (
+			dstFieldType, dstFieldFound = dstValue.Type().FieldByName(dstFieldName)
+			dstFieldValue               = dstValue.FieldByName(dstFieldName)
+		)
+
+		if !dstFieldFound {
+			continue
+		}
+
+		// Force option for empty interfaces and nullable types
+		_, force := tagOptions[ForceOptionName]
+
+		// Valuer -> ptr
+		if isNullableType(srcFieldType.Type) && dstFieldValue.Kind() == reflect.Ptr && force {
+			// We have same nullable type on both sides
+			if srcFieldValue.Type().AssignableTo(dstFieldType.Type) {
+				if srcFieldType.Type.Size() != dstFieldType.Type.Size() {
+					panic(fmt.Sprintf(
+						"srcFieldType.Type.Size() != dstFieldType.Type.Size(); "+
+							"srcFieldType:%+v; srcFieldType.Type: %+v; srcFieldType.Type.Size: %+v;"+
+							"dstFieldType:%+v; dstFieldType.Type: %+v; dstFieldType.Type.Size: %+v;",
+						srcFieldType, srcFieldType.Type, srcFieldType.Type.Size(),
+						dstFieldType, dstFieldType.Type, dstFieldType.Type.Size(),
+					))
+				}
+				fieldSpecs = append(fieldSpecs, fieldCopySpec{
+					size:      srcFieldType.Type.Size(),
+					srcOffset: srcFieldType.Offset,
+					dstOffset: dstFieldType.Offset,
+					copyType:  directCopy,
+				})
+				continue
+			}
+
+			v, _ := srcFieldValue.Interface().(driver.Valuer).Value()
+			if v == nil {
+				continue
+			}
+
+			valueType := reflect.TypeOf(v)
+
+			ptr := reflect.New(valueType)
+			panic("#1")
+			ptr.Elem().Set(reflect.ValueOf(v))
+
+			if valueType.AssignableTo(dstFieldType.Type.Elem()) {
+				panic("#2")
+				dstFieldValue.Set(ptr)
+			}
+
+			continue
+		}
+
+		// Valuer -> value
+		if isNullableType(srcFieldType.Type) {
+			// We have same nullable type on both sides
+			if srcFieldValue.Type().AssignableTo(dstFieldType.Type) {
+				panic("#3")
+				dstFieldValue.Set(srcFieldValue)
+				continue
+			}
+
+			if force {
+				v, _ := srcFieldValue.Interface().(driver.Valuer).Value()
+				if v == nil {
+					continue
+				}
+
+				rv := reflect.ValueOf(v)
+				if rv.Type().AssignableTo(dstFieldType.Type) {
+					panic("#4")
+					dstFieldValue.Set(rv)
+				}
+			}
+
+			continue
+		}
+
+		if dstFieldValue.Kind() == reflect.Interface {
+			if force {
+				if srcFieldValue.Kind() == reflect.Interface {
+					fieldSpecs = append(fieldSpecs, fieldCopySpec{
+						size:      srcFieldType.Type.Size(),
+						srcOffset: srcFieldType.Offset,
+						dstOffset: dstFieldType.Offset,
+						copyType:  directCopy,
+					})
+					continue
+				}
+				if srcFieldValue.Kind() == reflect.Ptr {
+					dummyValue := struct {
+						Field interface{}
+					}{
+						Field: srcFieldValue.Interface(),
+					}
+					dummyFiled := reflect.ValueOf(dummyValue).FieldByName("Field")
+					fieldSpecs = append(fieldSpecs, fieldCopySpec{
+						size:       srcFieldType.Type.Size(),
+						srcOffset:  srcFieldType.Offset,
+						srcTypePtr: dummyFiled.InterfaceData()[0],
+						dstOffset:  dstFieldType.Offset,
+						copyType:   ptrToInterfaceCopy,
+					})
+					continue
+				}
+				panic("unsupported src type for interface destination")
+			}
+			continue
+		}
+
+		// Ptr -> Value
+		if srcFieldType.Type.Kind() == reflect.Ptr && !srcFieldValue.IsNil() && dstFieldType.Type.Kind() != reflect.Ptr {
+			indirect := reflect.Indirect(srcFieldValue)
+			if indirect.Type().AssignableTo(dstFieldType.Type) {
+				fieldSpecs = append(fieldSpecs, fieldCopySpec{
+					size:      indirect.Type().Size(),
+					srcOffset: srcFieldType.Offset,
+					dstOffset: dstFieldType.Offset,
+					copyType:  indirectCopy,
+				})
+				continue
+			}
+		}
+
+		// Other types
+		if srcFieldType.Type.AssignableTo(dstFieldType.Type) {
+			if srcFieldType.Type.Size() != dstFieldType.Type.Size() {
+				panic(fmt.Sprintf(
+					"srcFieldType.Type.Size() != dstFieldType.Type.Size(); "+
+						"srcFieldType:%+v; srcFieldType.Type: %+v; srcFieldType.Type.Size: %+v;"+
+						"dstFieldType:%+v; dstFieldType.Type: %+v; dstFieldType.Type.Size: %+v;",
+					srcFieldType, srcFieldType.Type, srcFieldType.Type.Size(),
+					dstFieldType, dstFieldType.Type, dstFieldType.Type.Size(),
+				))
+			}
+			fieldSpecs = append(fieldSpecs, fieldCopySpec{
+				size:      srcFieldType.Type.Size(),
+				srcOffset: srcFieldType.Offset,
+				dstOffset: dstFieldType.Offset,
+				copyType:  directCopy,
+			})
+		}
+	}
+
+	for _, m := range srcMethodNames {
+		name, opts := getRelatedField(dst, m)
+		if name == "" {
+			continue
+		}
+
+		if _, ok := opts[SkipOptionName]; ok {
+			continue
+		}
+
+		method := reflect.ValueOf(src).MethodByName(m)
+		if !method.IsValid() {
+			return nil, fmt.Errorf("method %s is invalid", m)
+		}
+
+		var (
+			dstFieldType, _ = dstValue.Type().FieldByName(name)
+			dstFieldValue   = dstValue.FieldByName(name)
+			_, withContext  = opts[ContextOptionName]
+			_, force        = opts[ForceOptionName]
+		)
+
+		args := []reflect.Value{}
+		if withContext {
+			args = []reflect.Value{reflect.ValueOf(options.Context)}
+		}
+
+		var (
+			result          = method.Call(args)[0]
+			resultInterface = result.Interface()
+			resultValue     = reflect.ValueOf(resultInterface)
+			resultType      = resultValue.Type()
+		)
+
+		// Value -> Ptr
+		if dstFieldValue.Kind() == reflect.Ptr && force {
+			ptr := reflect.New(resultType)
+			panic("#365")
+			ptr.Elem().Set(resultValue)
+
+			if ptr.Type().AssignableTo(dstFieldType.Type) {
+				panic("#369")
+				dstFieldValue.Set(ptr)
+			}
+
+			continue
+		}
+
+		// Ptr -> value
+		if resultValue.Kind() == reflect.Ptr && force {
+			if resultValue.Elem().Type().AssignableTo(dstFieldType.Type) {
+				panic("#379")
+				dstFieldValue.Set(resultValue.Elem())
+			}
+
+			continue
+		}
+
+		if resultType.AssignableTo(dstFieldType.Type) && result.IsValid() {
+			panic("#387")
+			dstFieldValue.Set(result)
+		}
+	}
+
+	return fieldSpecs, nil
 }
 
 // process handles copy.
