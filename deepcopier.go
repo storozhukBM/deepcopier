@@ -82,18 +82,24 @@ func (dc *DeepCopier) From(src interface{}) error {
 type copyType byte
 
 const (
-	unknown            copyType = 0
-	directCopy         copyType = 1
-	indirectCopy       copyType = 2
-	ptrToInterfaceCopy copyType = 3
+	unknown                copyType = 0
+	valuerReflectCopy      copyType = 1
+	valuerReflectToPtrCopy copyType = 2
+	directCopy             copyType = 3
+	indirectCopy           copyType = 4
+	ptrToInterfaceCopy     copyType = 5
 )
 
 type fieldCopySpec struct {
-	size       uintptr
-	srcOffset  uintptr
-	srcTypePtr uintptr
-	dstOffset  uintptr
-	copyType   copyType
+	size         uintptr
+	srcOffset    uintptr
+	srcTypePtr   uintptr
+	srcFieldName string
+	dstOffset    uintptr
+	dstTypePtr   uintptr
+	dstFieldName string
+	copyType     copyType
+	force        bool
 }
 
 type interfaceTuple struct {
@@ -118,6 +124,12 @@ func executeSpec(specs []fieldCopySpec, dst interface{}, src interface{}) {
 	}
 	directDstMemory := *(*[]byte)(unsafe.Pointer(&directDstMemoryHdr))
 
+	var srcValuePtr *reflect.Value
+	var dstValuePtr *reflect.Value
+
+	var sysPtr uintptr
+	pointerSize := unsafe.Sizeof(sysPtr)
+
 	for _, copySpec := range specs {
 		switch copySpec.copyType {
 		case directCopy:
@@ -126,7 +138,7 @@ func executeSpec(specs []fieldCopySpec, dst interface{}, src interface{}) {
 			copy(dstMem, srcMem)
 			continue
 		case indirectCopy:
-			srcPointerMem := directSrcMemory[copySpec.srcOffset : copySpec.srcOffset+8]
+			srcPointerMem := directSrcMemory[copySpec.srcOffset : copySpec.srcOffset+pointerSize]
 			srcPointer := (*(*[]uintptr)(unsafe.Pointer(&srcPointerMem)))[0]
 			if srcPointer == 0 {
 				continue
@@ -150,6 +162,68 @@ func executeSpec(specs []fieldCopySpec, dst interface{}, src interface{}) {
 
 			dstInterfaceMemSlice[0] = copySpec.srcTypePtr
 			dstInterfaceMemSlice[1] = srcPtrMemSlice[0]
+			continue
+		case valuerReflectCopy:
+			if srcValuePtr == nil {
+				srcValue := reflect.Indirect(reflect.ValueOf(src))
+				srcValuePtr = &srcValue
+			}
+			srcFieldValue := srcValuePtr.FieldByName(copySpec.srcFieldName)
+			if srcFieldValue == (reflect.Value{}) {
+				continue
+			}
+			if dstValuePtr == nil {
+				dstValue := reflect.Indirect(reflect.ValueOf(dst))
+				dstValuePtr = &dstValue
+			}
+			dstFieldValue := dstValuePtr.FieldByName(copySpec.dstFieldName)
+			if dstFieldValue == (reflect.Value{}) {
+				continue
+			}
+
+			if srcFieldValue.Type().AssignableTo(dstFieldValue.Type()) {
+				dstFieldValue.Set(srcFieldValue)
+			}
+			if copySpec.force {
+				v, _ := srcFieldValue.Interface().(driver.Valuer).Value()
+				if v == nil {
+					continue
+				}
+
+				rv := reflect.ValueOf(v)
+				if rv.Type().AssignableTo(dstFieldValue.Type()) {
+					dstFieldValue.Set(rv)
+				}
+			}
+			continue
+		case valuerReflectToPtrCopy:
+			if srcValuePtr == nil {
+				srcValue := reflect.Indirect(reflect.ValueOf(src))
+				srcValuePtr = &srcValue
+			}
+			srcFieldValue := srcValuePtr.FieldByName(copySpec.srcFieldName)
+			if srcFieldValue == (reflect.Value{}) {
+				continue
+			}
+			if dstValuePtr == nil {
+				dstValue := reflect.Indirect(reflect.ValueOf(dst))
+				dstValuePtr = &dstValue
+			}
+			dstFieldValue := dstValuePtr.FieldByName(copySpec.dstFieldName)
+			if dstFieldValue == (reflect.Value{}) {
+				continue
+			}
+			v, _ := srcFieldValue.Interface().(driver.Valuer).Value()
+			if v == nil {
+				continue
+			}
+			valueType := reflect.TypeOf(v)
+			ptr := reflect.New(valueType)
+			ptr.Elem().Set(reflect.ValueOf(v))
+
+			if valueType.AssignableTo(dstFieldValue.Type().Elem()) {
+				dstFieldValue.Set(ptr)
+			}
 			continue
 		default:
 			panic(fmt.Sprintf("unsupported copy spec type: %+v", copySpec))
@@ -238,47 +312,22 @@ func preProcess(dst interface{}, src interface{}, args ...Options) ([]fieldCopyS
 				continue
 			}
 
-			v, _ := srcFieldValue.Interface().(driver.Valuer).Value()
-			if v == nil {
-				continue
-			}
-
-			valueType := reflect.TypeOf(v)
-
-			ptr := reflect.New(valueType)
-			panic("#1")
-			ptr.Elem().Set(reflect.ValueOf(v))
-
-			if valueType.AssignableTo(dstFieldType.Type.Elem()) {
-				panic("#2")
-				dstFieldValue.Set(ptr)
-			}
-
+			fieldSpecs = append(fieldSpecs, fieldCopySpec{
+				srcFieldName: srcFieldName,
+				dstFieldName: dstFieldName,
+				copyType:     valuerReflectToPtrCopy,
+			})
 			continue
 		}
 
 		// Valuer -> value
 		if isNullableType(srcFieldType.Type) {
-			// We have same nullable type on both sides
-			if srcFieldValue.Type().AssignableTo(dstFieldType.Type) {
-				panic("#3")
-				dstFieldValue.Set(srcFieldValue)
-				continue
-			}
-
-			if force {
-				v, _ := srcFieldValue.Interface().(driver.Valuer).Value()
-				if v == nil {
-					continue
-				}
-
-				rv := reflect.ValueOf(v)
-				if rv.Type().AssignableTo(dstFieldType.Type) {
-					panic("#4")
-					dstFieldValue.Set(rv)
-				}
-			}
-
+			fieldSpecs = append(fieldSpecs, fieldCopySpec{
+				srcFieldName: srcFieldName,
+				dstFieldName: dstFieldName,
+				copyType:     valuerReflectCopy,
+				force:        force,
+			})
 			continue
 		}
 
@@ -294,16 +343,10 @@ func preProcess(dst interface{}, src interface{}, args ...Options) ([]fieldCopyS
 					continue
 				}
 				if srcFieldValue.Kind() == reflect.Ptr {
-					dummyValue := struct {
-						Field interface{}
-					}{
-						Field: srcFieldValue.Interface(),
-					}
-					dummyFiled := reflect.ValueOf(dummyValue).FieldByName("Field")
 					fieldSpecs = append(fieldSpecs, fieldCopySpec{
 						size:       srcFieldType.Type.Size(),
 						srcOffset:  srcFieldType.Offset,
-						srcTypePtr: dummyFiled.InterfaceData()[0],
+						srcTypePtr: extractTypePtr(srcFieldValue),
 						dstOffset:  dstFieldType.Offset,
 						copyType:   ptrToInterfaceCopy,
 					})
@@ -413,6 +456,17 @@ func preProcess(dst interface{}, src interface{}, args ...Options) ([]fieldCopyS
 	}
 
 	return fieldSpecs, nil
+}
+
+func extractTypePtr(srcFieldValue reflect.Value) uintptr {
+	dummyValue := struct {
+		Field interface{}
+	}{
+		Field: srcFieldValue.Interface(),
+	}
+	dummyFiled := reflect.ValueOf(dummyValue).FieldByName("Field")
+	typePtr := dummyFiled.InterfaceData()[0]
+	return typePtr
 }
 
 // process handles copy.
